@@ -1,8 +1,10 @@
 # Using Drones to Detect Distances and Infractions in Field Events
 ## Project Overview
-The goal of this project is to develop a drone-based monitoring system to track infractions and measure distances in field throwing events – shot put, discus, hammer throw, and javelin. This system will assist human officials to detect infractions both where the athelete steps out of bounds or the object lands out of bounds. Furthermore, the system will report how far from the throwing circle the implement landed. As current officiating relies heavily on human judgement, which is error-prone, we hope our solution will make refereeing such events more accurate and efficient, without requiring technical expertise from the user.
+The goal of this project is to develop a drone-based monitoring system to assist officials in detecting infractions and measuring distances in field throwing events, including shot put, discus, hammer throw, and javelin. The system is designed to identify foot infractions (e.g., stepping out of bounds) as well as determine whether the implement lands outside the legal sector. Additionally, the system reports the distance from the throwing circle to the landing point.
 
-Our project will incorporate flying a drone equipped with computer vision as well as a ground system to detect foot infractions. Furthermore, our project will require a mobile app to serve as a translation layer to communicate with the drone's SDK. Finally, our system will include a graphical user interface for the referee to understand our system's decisions.
+Current officiating in these events relies heavily on human judgment, which can be error-prone and inconsistent. Our objective is to improve the accuracy and efficiency of officiating while minimizing the technical burden placed on referees.
+
+The system integrates an aerial drone equipped with computer vision, a ground-based sensing and processing pipeline, and a mobile application that serves as a translation layer to interface with the drone’s SDK. Furthermore, a graphical user interface allows referees to view detections, measurements, and system decisions in an intuitive and accessible manner.
 
 ## Team Mjölnir
 The following engineers contributed to this project.
@@ -17,19 +19,26 @@ The following engineers contributed to this project.
 - Max Wiesenfeld
 
 ## Repository Structure
-This section outlines the purpose of each directory in the repository. Anyone is welcome to update the structure as necessary. I didn't put critical thought into each of these, the goal was just to add some structure and organization.
+This section outlines the purpose of each directory in the repository.
 
-### computer_vision/
+The repository is organized by runtime environment, grouping software according to the **computer on which it executes**. This approach reflects the fact that each machine has distinct programming languages, dependencies, and build systems. As a result, each top-level directory is largely self-contained.
+
+Each runtime directory includes a `comms/` subdirectory to handle networking and message transport. Message definitions themselves are specified in a root-level `interfaces/` directory, which defines language-agnostic contracts shared across all systems. This separation prevents one runtime from depending on another runtime’s implementation details simply to interpret state or commands.
+
+### companion/
+The companion PC runs computer vision and high-level flight control logic (autonomy). The software stack here will be primarily Python.
+
+#### computer_vision/
 This section converts raw sensor data into interpretable information. OpenCV or ML code will go here to enable feature detection, tracking, camera calibration, etc.
 
 Inputs:
 * Camera frames
-* Kalman filtered sensors
+* State estimates
 
 Outputs:
 * Pixel position of object
 
-### flight_control/ 
+#### flight_control/ 
 This section decides what the drone should do next, based on computer vision outputs. This is where the state machine and high-level drone logic lives.
 
 Inputs:
@@ -39,21 +48,24 @@ Inputs:
 
 Outputs:
 * High-level commands to move a drone (move to given position, set velocity, etc.)
-* Take off
-* Land
+* Take off, Land, etc.
 
-### drone/          
-This section turns high level commands from flight control to drone-specific mobile SDK calls, allowing us to remotely control the drone based on our custom logic. This is where the translation layer to interface with the drone's mobile SDK lives.  
+### mobile/
+This directory features all software that will run on our Android mobile device. The mobile device is primarily responsible for translating high level commands from flight control to drone-specific mobile SDK calls, allowing us to remotely control the drone based on our custom logic. The software stack will primarily feature Kotlin and Java, and require a Gradle build system.
 
 Inputs:
 * Flight control commands
 
 Outputs:
-* Actually moving the drone
-* Telemetry indicating state
+* Execution of drone motion via SDK commands
+* Telemetry reporting drone state and health
 
-### comms/          
-This section will allow each of our modules to communicate with each other, regardless of what the payload is.
 
-### frontend/       
-This section is where our graphical user interface will live.  
+### ground/       
+This directory contains software that runs on the ground station used by the referee. The ground station provides a graphical user interface for monitoring detections, infractions, and distance measurements. The software stack primarily uses React and requires a Node.js runtime.
+
+Inputs:
+* Drone reports of infractions and measured distances
+
+Outputs:
+* Visualized results and status information presented to the referee
