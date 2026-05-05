@@ -6,7 +6,16 @@ use backend_lib::circle_infractions_ingest::begin_detecting_circle_infractions;
 #[cfg(feature = "real_cameras")]
 use backend_lib::pipeline::start_recorded_footage_pipelines;
 use backend_lib::server::{ThrowSource, create_api_router, start_server};
+use backend_lib::timing::init_global_time;
 use rust_embed::Embed;
+#[cfg(feature = "real_cameras")]
+use backend_lib::pipeline::{CameraId, Pipeline};
+#[cfg(feature = "real_cameras")]
+use backend_lib::camera_ingest::begin_live_dual_cam_ingest;
+#[cfg(feature = "real_cameras")]
+use backend_lib::pipeline::CAPACITY_PER_CROSSBEAM_CHANNEL;
+#[cfg(feature = "real_cameras")]
+use crossbeam::channel::bounded;
 
 const ARDUINO_BAUD_RATE: u32 = 115200;
 
@@ -34,11 +43,12 @@ pub fn create_prod_app(throw_source: ThrowSource) -> Router {
 #[cfg(not(feature = "real_cameras"))]
 #[tokio::main]
 async fn main() {
+    init_global_time();
     // Build the Axum router.
     let app = create_prod_app(ThrowSource::Simulated);
 
     // Start the Axum server.
-    start_server(app, "0.0.0.0:5001").await;
+    start_server(app, "0.0.0.0:5001", None).await;
 }
 
 // The "real_cameras" configuration will start the CV pipelines, and will point the
@@ -46,19 +56,35 @@ async fn main() {
 #[cfg(feature = "real_cameras")]
 #[tokio::main]
 async fn main() {
+    init_global_time();
     let args = parse_real_backend_args();
-    let rolling_buffer_size: usize = 10;
-    println!(
-        "Starting real prod backend in recorded-footage replay mode from {}.",
-        args.feed_footage_dir.display()
-    );
-    let _ = start_recorded_footage_pipelines(args.feed_footage_dir, rolling_buffer_size);
+    let (shutdown_tx, shutdown_rx) = bounded::<()>(5);
+    ctrlc::set_handler(move || {
+        for _ in 0..5 {
+            let _ = shutdown_tx.send(());
+        }
+    }).expect("Error setting Ctrl-C handler");
+    let (left_pipeline, right_pipeline) = if let Some(dir) = args.feed_footage_dir {
+        println!(
+            "Starting real prod backend in recorded-footage replay mode from {}.",
+            dir.display()
+        );
+        let (_, lp, rp) = start_recorded_footage_pipelines(dir, CAPACITY_PER_CROSSBEAM_CHANNEL);
+        (lp, rp)
+    } else {
+        let (left_rx, right_rx) = begin_live_dual_cam_ingest(args.left_camera_id, args.right_camera_id, 10_000.0, shutdown_rx.clone());
+        (
+            Pipeline::new(CameraId::FieldLeft, left_rx, CAPACITY_PER_CROSSBEAM_CHANNEL),
+            Pipeline::new(CameraId::FieldRight, right_rx, CAPACITY_PER_CROSSBEAM_CHANNEL),
+        )
+    };
 
     // Build the Axum router.
     let app = create_prod_app(ThrowSource::Camera);
 
-    // Start the Axum server.
-    start_server(app, "0.0.0.0:5001").await;
-
-    // TODO(#7): Implement Clean Shutdown.
+    start_server(app, "0.0.0.0:5001", Some(shutdown_rx)).await;
+    println!("Stopping pipelines...");
+    left_pipeline.stop();
+    right_pipeline.stop();
+    println!("Done!");
 }

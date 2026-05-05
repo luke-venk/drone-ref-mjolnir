@@ -1,6 +1,7 @@
 use crate::circle_infractions_ingest::CircleInfractionDetectionState;
 use crate::throws::ThrowType;
 use crate::server::app_state::AppState;
+use crate::server::frames_route::get_frame;
 use crate::throws::{simulate_throw::simulate_throw_event, *};
 use super::ThrowSource;
 use axum::{
@@ -10,6 +11,7 @@ use axum::{
     response::IntoResponse,
     routing::{get, post},
 };
+use crate::timing::global_time;
 use crossbeam::channel::Receiver;
 use serde_json::json;
 
@@ -54,21 +56,36 @@ async fn get_throw_type(State(state): State<AppState>) -> Json<GetThrowTypeRespo
 // source is `Camera`.
 async fn get_throw_results(State(state): State<AppState>) -> Json<ThrowAnalysisResponse> {
     let throw_type: ThrowType = *state.throw_type.read().await;
-    match state.throw_source {
-        ThrowSource::Simulated => Json(simulate_throw_event(throw_type)),
+    let mut result: ThrowAnalysisResponse = match state.throw_source {
+        ThrowSource::Simulated => simulate_throw_event(throw_type),
         ThrowSource::Camera => {
             // TODO(#28)
             // NOTE: I'm having these 2 do the same thing for now, but how would this actually work?
             // Would it like continually listen for our final output function (that relies on the math scripts)
             // to return a ThrowAnalysisResponse?
-            Json(simulate_throw_event(throw_type))
+            simulate_throw_event(throw_type)
         }
+    };
+    let now_ns = global_time()
+        .camera_ptp_time_now_approximation_nanoseconds()
+        .unwrap_or_else(|| {
+            global_time().now_monotonic_in_nanoseconds_since_unix_epoch()
+        });
+    let ten_seconds_ago_ns = now_ns.saturating_sub(10_000_000_000);
+    let history = state.get_infraction_history().await;
+    let has_recent_circle_infractions = history.iter().any(|&ts| ts >= ten_seconds_ago_ns && ts <= now_ns);
+    if has_recent_circle_infractions {
+        result.infractions.push(InfractionType::Circle);
     }
+    Json(result)
 }
 
 // In both dev and prod mode, the router will require the HTTP routes
 // and the thread-safe shared app state.
-pub fn create_api_router(throw_source: ThrowSource, circle_rx: Receiver<CircleInfractionDetectionState>) -> Router {
+pub fn create_api_router(
+    throw_source: ThrowSource,
+    circle_rx: Receiver<CircleInfractionDetectionState>,
+) -> Router {
     // Thread-safe shared app state for current throw event.
     let state = AppState::new(throw_source);
     let state_clone = state.clone();
@@ -95,23 +112,35 @@ pub fn create_api_router(throw_source: ThrowSource, circle_rx: Receiver<CircleIn
     let http_routes = Router::new()
         .route("/health", get(health_check))
         .route("/throw-type", post(post_throw_type).get(get_throw_type))
-        .route("/analyze-throw", get(get_throw_results));
+        .route("/analyze-throw", get(get_throw_results))
+        .route("/frames/{camera}", get(get_frame));
 
     // Nest the routes behind the "/api" prefix so no naming collisions
     // with frontend requests.
     Router::new().nest("/api", http_routes).with_state(state)
 }
 
-pub async fn start_server(app: Router, addr: &str) {
+pub async fn start_server(app: Router, addr: &str, shutdown_rx: Option<Receiver<()>>) {
     // Listener.
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .expect("Failed to bind TCP listener.");
 
-    // Start the server.
-    axum::serve(listener, app)
-        .await
-        .expect("Failed to start server.");
+    match shutdown_rx {
+        Some(rx) => {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    tokio::task::spawn_blocking(move || rx.recv()).await.ok();
+                })
+                .await
+                .expect("failed to serve app");
+        },
+        None => {
+            axum::serve(listener, app)
+                .await
+                .expect("failed to serve app");
+        },
+    };
 }
 
 #[cfg(test)]
@@ -198,5 +227,68 @@ mod tests {
             .unwrap();
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_frames_route_returns_404_when_slot_is_empty() {
+        let (_, rx) = crossbeam::channel::bounded::<CircleInfractionDetectionState>(1);
+        let app: Router = create_api_router(ThrowSource::Camera, rx);
+
+        let request = Request::builder()
+            .uri("/api/frames/left")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_frames_route_returns_404_for_unknown_camera() {
+        let (_, rx) = crossbeam::channel::bounded::<CircleInfractionDetectionState>(1);
+        let app: Router = create_api_router(ThrowSource::Camera, rx);
+
+        let request = Request::builder()
+            .uri("/api/frames/middle")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_frames_route_serves_published_impact_frame_as_png() {
+        use crate::pipeline::CameraId;
+
+        // Build the app inline so the test can publish an impact frame
+        // into AppState before issuing the request.
+        let state = AppState::new(ThrowSource::Camera);
+        state
+            .set_impact_frame(CameraId::FieldLeft, (vec![0x42u8; 16], (4, 4)))
+            .await;
+
+        let http_routes = Router::new()
+            .route("/health", get(health_check))
+            .route("/throw-type", post(post_throw_type).get(get_throw_type))
+            .route("/analyze-throw", get(get_throw_results))
+            .route("/frames/{camera}", get(get_frame));
+        let app: Router = Router::new().nest("/api", http_routes).with_state(state);
+
+        let request = Request::builder()
+            .uri("/api/frames/left")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("content-type")
+                .map(|v| v.to_str().unwrap()),
+            Some("image/png")
+        );
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        // PNG files start with the magic bytes 89 50 4E 47 0D 0A 1A 0A.
+        assert_eq!(&body[..8], &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]);
     }
 }
