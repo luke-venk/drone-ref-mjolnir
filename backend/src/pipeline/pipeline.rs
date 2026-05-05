@@ -24,7 +24,12 @@ impl Pipeline {
         let (tx_stage3, rx_stage4) = bounded::<PipelineFrame>(capacity_per_channel);
         let (tx_stage4, rx_output) = bounded::<PipelineFrame>(capacity_per_channel);
 
-        let handle_stage1 = PipelineStage::new(rx_stage1, tx_stage1, undistortion).spawn();
+        // Use a closure for the first stage since it needs camera_id, but we only have
+        // pipeline stages take `frame` as an argument.
+        let handle_stage1 = PipelineStage::new(rx_stage1, tx_stage1, move |frame| {
+            undistortion(frame, camera_id)
+        })
+        .spawn();
         let handle_stage2 =
             PipelineStage::new(rx_stage2, tx_stage2, forward_downsampled_copy).spawn();
         let handle_stage3 = PipelineStage::new(rx_stage3, tx_stage3, mog2).spawn();
@@ -167,11 +172,17 @@ mod tests {
         let right_frames: Vec<_> = right_rx.try_iter().collect();
 
         assert_eq!(left_frames.len(), 1);
-        assert_eq!(left_frames[0].raw_bytes_full_resolution().as_ref(), &[1, 2, 3, 4]);
+        assert_eq!(
+            left_frames[0].raw_bytes_full_resolution().as_ref(),
+            &[1, 2, 3, 4]
+        );
         assert_eq!(left_frames[0].context().camera_id(), CameraId::FieldLeft);
         assert_eq!(left_frames[0].context().camera_buffer_timestamp(), 200);
         assert_eq!(right_frames.len(), 1);
-        assert_eq!(right_frames[0].raw_bytes_full_resolution().as_ref(), &[5, 6, 7, 8]);
+        assert_eq!(
+            right_frames[0].raw_bytes_full_resolution().as_ref(),
+            &[5, 6, 7, 8]
+        );
         assert_eq!(right_frames[0].context().camera_id(), CameraId::FieldRight);
         assert_eq!(right_frames[0].context().camera_buffer_timestamp(), 210);
 
@@ -316,8 +327,14 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .expect("pipeline should produce one output frame");
 
-        assert_eq!(output_frame.raw_bytes_full_resolution().as_ref(), file_bytes.as_slice());
-        assert_eq!(output_frame.context().camera_buffer_timestamp(), input_timestamp);
+        assert_eq!(
+            output_frame.raw_bytes_full_resolution().as_ref(),
+            file_bytes.as_slice()
+        );
+        assert_eq!(
+            output_frame.context().camera_buffer_timestamp(),
+            input_timestamp
+        );
 
         for handle in handles {
             handle
@@ -348,7 +365,10 @@ mod tests {
         let (tx_stage4, rx_output) = bounded::<PipelineFrame>(capacity);
 
         let handles = vec![
-            PipelineStage::new(rx_stage1, tx_stage1, undistortion).spawn(),
+            PipelineStage::new(rx_stage1, tx_stage1, |frame| {
+                undistortion(frame, CameraId::FieldLeft)
+            })
+            .spawn(),
             PipelineStage::new(rx_stage2, tx_stage2, forward_downsampled_copy).spawn(),
             PipelineStage::new(rx_stage3, tx_stage3, mog2).spawn(),
             PipelineStage::new(rx_stage4, tx_stage4, contour).spawn(),
@@ -375,14 +395,11 @@ mod tests {
                           tx: crossbeam::channel::Sender<PipelineFrame>| {
             let stage_log = Arc::clone(&travel_log);
             PipelineStage::new(rx, tx, move |frame: PipelineFrame| {
-                stage_log
-                    .lock()
-                    .expect("travel log lock")
-                    .push((
-                        frame.context().camera_id(),
-                        stage_index,
-                        frame.context().camera_buffer_timestamp(),
-                    ));
+                stage_log.lock().expect("travel log lock").push((
+                    frame.context().camera_id(),
+                    stage_index,
+                    frame.context().camera_buffer_timestamp(),
+                ));
                 frame
             })
             .spawn()
